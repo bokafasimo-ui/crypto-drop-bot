@@ -1,14 +1,17 @@
 import os
 import sys
 import html
+import time
 import requests
+
+from supabase_helper import get_client
 
 # ==========================
 # قراءة المفاتيح السرية من البيئة (GitHub Secrets)
 # ==========================
 CMC_API_KEY = os.environ.get("CMC_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # يُستخدم كإشعار احتياطي لك فقط عند الأخطاء
 
 CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
@@ -21,8 +24,6 @@ def validate_env_vars():
         missing.append("CMC_API_KEY")
     if not TELEGRAM_TOKEN:
         missing.append("TELEGRAM_TOKEN")
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
     if missing:
         print(f"متغيرات بيئة مفقودة: {', '.join(missing)}")
         sys.exit(1)
@@ -61,8 +62,6 @@ def get_top_losers(coins, top_n=5):
 def build_coin_market_url(slug):
     """
     بناء رابط صفحة الأسواق (Markets) الخاصة بالعملة على CoinMarketCap مباشرة.
-    ملاحظة: هذا الرابط مؤقت (مباشر بدون إعلان) وسيُستبدل لاحقًا
-    عند دمج منصة الإعلانات (سيتم تعديل هذه الدالة فقط دون المساس ببقية الكود).
     """
     return f"https://coinmarketcap.com/currencies/{slug}/#Markets"
 
@@ -88,22 +87,62 @@ def build_message(losers):
     return "\n".join(lines)
 
 
-def send_telegram_message(text):
-    """إرسال الرسالة إلى قناة/محادثة تليجرام المحددة."""
+def get_all_subscribers(supabase):
+    """جلب قائمة chat_id لكل المستخدمين المسجلين في قاعدة البيانات."""
+    res = supabase.table("bot_users").select("chat_id").execute()
+    return [row["chat_id"] for row in res.data]
+
+
+def send_telegram_message(chat_id, text):
+    """إرسال الرسالة إلى محادثة تليجرام محددة."""
     url = TELEGRAM_API_URL.format(token=TELEGRAM_TOKEN)
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
     response = requests.post(url, data=payload, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    return response
+
+
+def remove_user(supabase, chat_id):
+    """حذف مستخدم من قاعدة البيانات (عند اكتشاف أنه حظر البوت أو غادره)."""
+    supabase.table("bot_users").delete().eq("chat_id", chat_id).execute()
+
+
+def broadcast_message(supabase, subscribers, text):
+    """إرسال الرسالة لكل المشتركين، مع حذف من حظر البوت تلقائيًا من القائمة."""
+    sent = 0
+    failed = 0
+    removed = 0
+    for chat_id in subscribers:
+        try:
+            response = send_telegram_message(chat_id, text)
+            if response.status_code == 200:
+                sent += 1
+            elif response.status_code == 403:
+                # المستخدم حظر البوت أو غادره: يُحذف من قاعدة البيانات مباشرة
+                remove_user(supabase, chat_id)
+                removed += 1
+            else:
+                failed += 1
+                print(f"فشل الإرسال إلى {chat_id}: {response.text}")
+            time.sleep(0.05)  # تجنب تجاوز حدود Telegram لعدد الرسائل في الثانية
+        except requests.exceptions.RequestException as e:
+            failed += 1
+            print(f"خطأ أثناء الإرسال إلى {chat_id}: {e}")
+    return sent, failed, removed
 
 
 def main():
     validate_env_vars()
+
+    try:
+        supabase = get_client()
+    except RuntimeError as e:
+        print(f"خطأ في الاتصال بـ Supabase: {e}")
+        sys.exit(1)
 
     try:
         coins = fetch_top_1000_coins()
@@ -123,14 +162,19 @@ def main():
 
     message = build_message(top_losers)
 
-    try:
-        send_telegram_message(message)
-        print("تم إرسال الرسالة بنجاح.")
-    except requests.exceptions.RequestException as e:
-        print(f"خطأ أثناء إرسال الرسالة إلى تليجرام: {e}")
-        sys.exit(1)
+    subscribers = get_all_subscribers(supabase)
+
+    if not subscribers:
+        print("لا يوجد مشتركون مسجلون بعد.")
+        return
+
+    sent, failed, removed = broadcast_message(supabase, subscribers, message)
+    print(
+        f"تم الإرسال إلى {sent} مستخدم، "
+        f"فشل الإرسال إلى {failed} مستخدم، "
+        f"تم حذف {removed} مستخدم غادر/حظر البوت."
+    )
 
 
 if __name__ == "__main__":
     main()
-# trigger
